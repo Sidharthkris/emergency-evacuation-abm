@@ -80,30 +80,30 @@ The model is built around four core components:
 │                  NetLogo Environment                │
 │                                                     │
 │  ┌──────────────┐      ┌──────────────────────────┐ │
-│  │  Agent Layer │      │   Environment Layer       │ │
-│  │              │      │                           │ │
-│  │ • Students   │◄────►│ • Hall Layout (Grid)      │ │
-│  │ • Professor  │      │ • Exit Configurations     │ │
-│  │ • Behaviors  │      │ • Obstacles & Aisles      │ │
+│  │  Agent Layer │      │   Environment Layer      │ │
+│  │              │      │                          │ │
+│  │ • Students   │◄────►│ • Hall Layout (Grid)     │ │
+│  │ • Professor  │      │ • Exit Configurations    │ │
+│  │ • Behaviors  │      │ • Obstacles & Aisles     │ │
 │  └──────┬───────┘      └──────────────────────────┘ │
-│         │                                            │
+│         │                                           │
 │  ┌──────▼───────────────────────────┐               │
-│  │       Behavior & Decision Layer   │               │
-│  │                                   │               │
-│  │ • Pathfinding (Modified BFS)      │               │
-│  │ • Panic Propagation (Contagion)   │               │
-│  │ • Exit Choice Strategy            │               │
-│  │ • Social Dynamics (Herding)       │               │
-│  └──────┬────────────────────────────┘              │
-│         │                                            │
+│  │       Behavior & Decision Layer  │               │
+│  │                                  │               │
+│  │ • Pathfinding (Modified BFS)     │               │
+│  │ • Panic Propagation (Contagion)  │               │
+│  │ • Exit Choice Strategy           │               │
+│  │ • Social Dynamics (Herding)      │               │
+│  └──────┬───────────────────────────┘               │
+│         │                                           │
 │  ┌──────▼──────────────────────────┐                │
-│  │         Data & Metrics Layer     │                │
-│  │                                  │                │
-│  │ • Evacuation Time Tracking       │                │
-│  │ • Bottleneck Detection           │                │
-│  │ • Panic Level Monitoring         │                │
-│  │ • Agent Flow Rate Analysis       │                │
-│  └──────────────────────────────────┘               │
+│  │         Data & Metrics Layer    │                │
+│  │                                 │                │
+│  │ • Evacuation Time Tracking      │                │
+│  │ • Bottleneck Detection          │                │
+│  │ • Panic Level Monitoring        │                │
+│  │ • Agent Flow Rate Analysis      │                │
+│  └─────────────────────────────────┘                │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -232,8 +232,8 @@ Leader agents (e.g., the professor) demonstrated disproportionate positive impac
 
 1. **Clone or download** this repository:
    ```bash
-   git clone https://github.com/Sidharthkris/emergency-evacuation-simulation.git
-   cd emergency-evacuation-simulation
+   git clone https://github.com/Sidharthkris/emergency-evacuation-abm.git
+   cd emergency-evacuation-abm
    ```
 
 2. **Open NetLogo** on your system.
