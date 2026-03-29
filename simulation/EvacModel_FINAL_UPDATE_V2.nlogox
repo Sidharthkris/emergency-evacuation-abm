@@ -1,0 +1,3100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.0" snapToGrid="false">
+  <code><![CDATA[extensions [table]
+; ========================================================================
+; GLOBAL VARIABLES
+; ========================================================================
+globals [
+  professor                    ; Reference to the professor turtle
+  avg-panic-level              ; Average panic level of all students
+  exit-patches                 ; Set of all exit patches
+  left-exit-patches            ; Set of exit patches on the left
+  right-exit-patches           ; Set of exit patches on the right
+  evacuation-start-time        ; Simulation time when evacuation starts (seconds)
+  evacuation-end-time          ; Simulation time when evacuation ends (seconds)
+  total-evacuation-time        ; Total time taken for evacuation (seconds)
+  bottleneck-locations         ; List of patches experiencing bottlenecks
+  strategy-evacuation-times    ; Table: strategy -> list of evacuation times
+  evacuation-started?          ; Flag: has evacuation started
+  first-exit-time              ; Time when the first evacuation occurred (seconds)
+  last-exit-time               ; Time when the last evacuation occurred (seconds)
+  total-distance-traveled      ; Total distance traveled by all turtles
+  max-congestion-level         ; Maximum congestion level observed
+  congestion-events            ; Number of congestion events
+  simulation-results           ; Table for storing simulation results
+  alarm-sounded?               ; Flag: has alarm sounded
+  alarm-patch                  ; Reference to the alarm patch
+  alarm-sound-time             ; Time when alarm actually sounded (seconds)
+
+  ; TIME CONVERSION CONSTANTS
+  seconds-per-tick             ; How many seconds each tick represents
+  current-time                 ; Current simulation time in seconds
+
+  ; REALISTIC MOVEMENT SPEEDS (m/s converted to patches/tick)
+  unimpeded-walking-speed      ; 1.2 m/s - for rational agents in low density
+  average-evacuation-speed     ; 1.0 m/s - typical student speed
+  impaired-walking-speed       ; 0.42 m/s - for agents with disabilities
+  patch-size-meters            ; Size of each patch in meters
+
+  ; STAIR MOVEMENT MODIFIERS
+  stair-speed-modifier         ; Speed reduction factor for stairs (0.6-0.7 typical)
+  stair-patches                ; Patches that are stairs
+  cumulative-time-on-stairs    ; Total time spent on stairs by all evacuated turtles
+]
+
+; ========================================================================
+; TURTLE VARIABLES
+; ========================================================================
+turtles-own [
+  stood-up?                ; Has the turtle stood up to evacuate?
+  is-professor?            ; Is this turtle the professor?
+  panic-level              ; Current panic level (0-100)
+  wait-time                ; Time spent waiting (for calm-and-orderly) in seconds
+  my-leader                ; Reference: leader turtle (for follow-others)
+  evacuation-strategy      ; The assigned evacuation strategy
+  stuck-time               ; Number of seconds turtle has been stuck
+  path-to-exit             ; List of patches to the exit
+  current-path-index       ; Index in path-to-exit
+  recalc-path-timer        ; Timer for path recalculation throttling (seconds)
+  base-speed               ; Base movement speed
+  evacuation-time          ; Time taken to evacuate (seconds)
+  initial-position         ; Starting position (list: xcor ycor)
+  distance-traveled        ; Total distance traveled
+  time-stood-up            ; Time when turtle stood up (seconds)
+  congestion-encounters    ; Number of congestion encounters
+  individual-reaction-delay ; Individual reaction time variation (seconds)
+  familiar?                ; Is this turtle familiar with the exits?
+  is-impaired?             ; Boolean: true for mobility issues
+
+  ; New variables for improved behavior
+  desired-speed            ; Desired movement speed based on panic
+  actual-speed             ; Actual achieved speed
+  personal-space-radius    ; Minimum comfortable distance from others
+  chosen-exit              ; The exit this turtle is heading towards
+  exit-visible?            ; Can the turtle see any exit
+  following-group?         ; Is actively following a group (for herding)
+  group-members            ; Other turtles in the same group
+  pushing-force            ; Force applied when pushing through crowd
+  patience-level           ; How patient the turtle is (affects pushing)
+  exit-knowledge           ; Knowledge about exit locations (0-1)
+  time-on-stairs           ; Time spent on stairs (seconds)
+  current-tier             ; Current tier level for tiered halls
+]
+
+; ========================================================================
+; PATCH VARIABLES
+; ========================================================================
+patches-own [
+  turtle?              ; Is there a turtle currently on this patch?
+  distance-from-exit   ; Distance from this patch to the nearest exit
+  visited?             ; Used for BFS calculations
+  parent-patch         ; Used for BFS calculations
+  walkable?            ; Can turtles walk on this patch?
+  congestion-count     ; Number of times congestion occurred on this patch
+  total-traffic        ; Total turtles traversing this patch
+  tier-level           ; For tiered lecture halls, row/tier number
+  is-alarm?            ; Is this patch the alarm?
+  density-level        ; Current density of turtles nearby
+  exit-visibility      ; How visible exits are from this patch
+  blocked?             ; Is this exit blocked? (for exit patches only)
+  is-stair?            ; Is this patch a stair/aisle in tiered layout?
+  exit-throughput-budget ; Capacity budget for this exit patch (persons)
+]
+
+; ========================================================================
+; SETUP PROCEDURES
+; ========================================================================
+
+; Main initialization procedure: clears, sets up hall, students, exits, and stats
+to setup
+  clear-all
+  clear-output
+
+  ; Set realistic time and space scales
+  set seconds-per-tick 0.1  ; 0.1 seconds per tick for finer movement
+  set patch-size-meters 0.5  ; Each patch = 0.5m x 0.5m
+
+  ; Correct speed conversions (m/s to patches/tick)
+  set unimpeded-walking-speed (1.2 / patch-size-meters) * seconds-per-tick     ; 1.2 m/s
+  set average-evacuation-speed (1.0 / patch-size-meters) * seconds-per-tick    ; 1.0 m/s
+  set impaired-walking-speed (0.42 / patch-size-meters) * seconds-per-tick     ; 0.42 m/s
+
+  ; Stair speed modifier (65% of normal speed, based on 0.7m/s on stairs vs 1.1m/s flat)
+  set stair-speed-modifier 0.65
+
+  ; --- NEW: Resize world based on layout ---
+  ifelse lecture-hall-layout = "wide-auditorium"
+    [ resize-world -21 21 -16 16 ]
+    [ ifelse lecture-hall-layout = "center-aisle-only"
+      [ resize-world -12 12 -16 16 ]  ; Smaller world for center-exit-only
+      [ resize-world -14 14 -16 16 ]  ; Default size for other layouts
+    ]
+
+  ask patches [ setup-lecture-hall ]
+  set-default-shape turtles "person"
+
+  ; Identify all exit patches and categorize by side
+  set exit-patches patches with [pcolor = lime]
+  set left-exit-patches patches with [pcolor = lime and pxcor < 0]
+  set right-exit-patches patches with [pcolor = lime and pxcor > 0]
+
+  ; Initialize throughput budgets on exits
+  ask exit-patches [
+    set exit-throughput-budget 0
+  ]
+
+  setup-walkable-patches
+  setup-stairs
+  setup-alarm
+  calculate-exit-distances
+  calculate-exit-visibility
+
+  ; Initialize alarm variables
+  set alarm-sounded? false
+  set alarm-sound-time 0
+
+  ; Initialize data structures and statistics
+  set strategy-evacuation-times table:make
+  set simulation-results table:make
+  set bottleneck-locations []
+  set evacuation-started? false
+  set evacuation-start-time 0
+  set evacuation-end-time 0
+  set first-exit-time 0
+  set last-exit-time 0
+  set congestion-events 0
+  set max-congestion-level 0
+  set total-distance-traveled 0
+  set cumulative-time-on-stairs 0
+
+  ; Prepare evacuation time lists by strategy
+  table:put strategy-evacuation-times "panic-rush" []
+  table:put strategy-evacuation-times "calm-and-orderly" []
+  table:put strategy-evacuation-times "follow-others" []
+  table:put strategy-evacuation-times "nearest-exit" []
+
+  ; Create student turtles and assign properties and strategies
+  create-turtles number-of-students [
+    allocate-students
+    set stood-up? false
+    set is-professor? false
+
+    ; Initialize panic level with normal distribution
+    set panic-level random-normal initial-panic-level 10
+    set panic-level max (list 0 min (list panic-level 100))
+
+    set wait-time 0
+    set stuck-time 0
+    set my-leader nobody
+    set path-to-exit []
+    set current-path-index 0
+    set recalc-path-timer 0
+    assign-evacuation-strategy
+
+    ; --- NEW: Assign impairment status ---
+    set is-impaired? (random-float 100 < percent-impaired)
+
+    ; --- CORRECTED: Use a log-normal distribution for reaction delay based on literature (e.g., Kuligowski et al.)
+    ifelse is-impaired?
+      [ set individual-reaction-delay (random-log-normal 5.0 0.6) + 30 ] ; Impaired agents have a longer base delay
+      [ set individual-reaction-delay (random-log-normal 4.5 0.5) ]  ; Approx. 90s mean, with a right-skewed tail
+
+    ; Ensure the delay is not excessively short
+    if individual-reaction-delay < 10 [ set individual-reaction-delay 10 ]
+
+
+    set-strategy-parameters
+    set initial-position (list xcor ycor)
+    set distance-traveled 0
+    set evacuation-time 0
+    set time-stood-up 0
+    set congestion-encounters 0
+    set time-on-stairs 0
+    set current-tier tier-level
+
+    ; Set familiarity status
+    set familiar? (random-float 100 < familiarity-percentage)
+    set exit-knowledge (ifelse-value familiar? [0.8 + random-float 0.2] [0.2 + random-float 0.3])
+
+    ; Initialize new behavioral variables
+    set personal-space-radius 1.0
+    set chosen-exit nobody
+    set exit-visible? false
+    set following-group? false
+    set group-members []
+    set pushing-force 0
+    set patience-level random-normal 50 20
+    set patience-level max (list 0 min (list patience-level 100))
+  ]
+
+  ; Create a professor turtle at the front
+  create-turtles 1 [
+    set professor self
+    setxy 0 14
+    set color blue
+    set is-professor? true
+    set stood-up? false
+    set panic-level 0
+    set wait-time 0
+    set stuck-time 0
+    set my-leader nobody
+    set path-to-exit []
+    set current-path-index 0
+    set recalc-path-timer 0
+    set evacuation-strategy "calm-and-orderly"
+    set base-speed (1.2 * seconds-per-tick / patch-size-meters) ; Professor speed: 1.2 m/s
+    set desired-speed base-speed
+    set actual-speed 0
+    set initial-position (list xcor ycor)
+    set distance-traveled 0
+    set evacuation-time 0
+    set time-stood-up 0
+    set congestion-encounters 0
+    set individual-reaction-delay (random-log-normal 4.5 0.5)
+    set familiar? true
+    set exit-knowledge 1.0
+    set personal-space-radius 1.5
+    set chosen-exit nobody
+    set exit-visible? false
+    set following-group? false
+    set group-members []
+    set pushing-force 0
+    set patience-level 80
+    set is-impaired? false
+    set time-on-stairs 0
+    set current-tier 0
+  ]
+
+  set avg-panic-level 0
+
+  ; Display simulation header
+  output-print "╔══════════════════════════════════════════════════════════════════════════════╗"
+  output-print "║                          FIRE EVACUATION SIMULATION                          ║"
+  output-print "╠══════════════════════════════════════════════════════════════════════════════╣"
+  output-print (word "║ Date/Time: " date-and-time " ")
+  output-print (word "║ Layout: " lecture-hall-layout " ")
+  output-print (word "║ Students: " number-of-students " ")
+  output-print (word "║ Initial Panic: " initial-panic-level " ")
+  output-print (word "║ Behavior: " evacuation-behavior " ")
+  output-print (word "║ Familiarity: " familiarity-percentage "%" " ")
+  output-print (word "║ Fire Alarm Time: " (alarm-time * seconds-per-tick) " seconds ")
+  output-print (word "║ Time Scale: " seconds-per-tick " seconds per tick " )
+  output-print (word "║ Space Scale: " patch-size-meters " meters per patch " )
+  output-print (word "║ Exit Blockage: " (ifelse-value exit-blockage? ["YES"] ["NO"]) " ")
+  output-print (word "║ Stair Speed Modifier: " (precision (stair-speed-modifier * 100) 0) "% of normal " )
+  output-print (word "║ Exit Capacity: " exit-capacity-per-meter " persons/s/m " )
+  output-print "╚══════════════════════════════════════════════════════════════════════════════╝"
+
+  reset-ticks
+  update-colors ; Initial color update
+
+  ask patches with [is-stair? = true] [ set pcolor 38 ]
+end
+
+; Convert seconds to min:sec format
+to-report format-time [total-seconds]
+  if total-seconds < 60 [
+    report (word (precision total-seconds 1) " sec")
+  ]
+  let minutes floor (total-seconds / 60)
+  let seconds precision (total-seconds mod 60) 1
+  report (word minutes " min " seconds " sec")
+end
+
+; Set up the lecture hall environment
+to setup-lecture-hall
+  set pcolor white
+  set tier-level 0
+  set is-alarm? false
+  set is-stair? false
+  set density-level 0
+  set exit-visibility 0
+  set blocked? false
+  set exit-throughput-budget 0
+
+  ; Walls around edges based on current world dimensions
+  if (abs pycor = max-pycor or abs pxcor = max-pxcor) [ set pcolor black ]
+
+  ; -- Define exit coordinates based on layout and slider --
+  let start-py-top-exit (14 - exit-width + 1)
+  let start-px-bot-left -13
+  let end-px-bot-left (-13 + exit-width - 1)
+  let start-px-bot-right (13 - exit-width + 1)
+  let end-px-bot-right 13
+
+  let start-py-top-exit2 (-13 - exit-width + 1)
+
+  let start-py-top-exit1 (14 - exit-width + 1)
+  let start-px-bot-left1 -20
+  let end-px-bot-left1 (-20 + exit-width - 1)
+  let start-px-bot-right1 (20 - exit-width + 1)
+  let end-px-bot-right1 20
+
+  ; --- LAYOUT SPECIFIC SETUP ---
+
+  if lecture-hall-layout = "traditional" [
+    if (pxcor = -14 and pycor >= start-py-top-exit and pycor <= 14) [ set pcolor lime ]
+    if (pxcor = 14 and pycor >= start-py-top-exit2 and pycor <= -13) [ set pcolor lime ]
+  ]
+
+  if lecture-hall-layout = "center-side-aisle" [
+    ; Top-left exit
+    if (pxcor = -14 and pycor >= start-py-top-exit and pycor <= 14) [
+      ifelse exit-blockage? and random 2 = 0 [ set pcolor black ] [ set pcolor lime ]
+    ]
+    ; Bottom-left exit
+    if (pycor = -16 and pxcor >= start-px-bot-left and pxcor <= end-px-bot-left) [ set pcolor lime ]
+    ; Bottom-right exit
+    if (pycor = -16 and pxcor >= start-px-bot-right and pxcor <= end-px-bot-right) [ set pcolor lime ]
+  ]
+
+  if lecture-hall-layout = "center-aisle-only" [
+    ; Single exit at the bottom center
+    let center-exit-start (- floor(exit-width / 2))
+    let center-exit-end (floor(exit-width / 2))
+    ; Adjust for even width
+    if exit-width mod 2 = 0 [
+      set center-exit-end center-exit-end - 1
+    ]
+    ; Place exit at bottom center
+    if (pycor = -16 and pxcor >= center-exit-start and pxcor <= center-exit-end) [
+      set pcolor lime
+    ]
+    if (pxcor = -12 and pycor >= start-py-top-exit and pycor <= 14) [ set pcolor lime ]
+  ]
+
+  if lecture-hall-layout = "tiered" [
+    ; Top-left exit
+    if (pxcor = -14 and pycor >= start-py-top-exit and pycor <= 14) [
+      ifelse exit-blockage? and random 2 = 0 [ set pcolor black ] [ set pcolor lime ]
+    ]
+    ; Bottom-right exit
+    if (pycor = -16 and pxcor >= start-px-bot-right and pxcor <= end-px-bot-right) [ set pcolor lime ]
+  ]
+
+  ; --- NEW/MODIFIED LAYOUTS ---
+  if lecture-hall-layout = "wide-auditorium" [
+    if (pxcor = -21 and pycor >= start-py-top-exit1 and pycor <= 14) [ set pcolor lime ]
+    if (pxcor = 21 and pycor >= start-py-top-exit1 and pycor <= 14) [ set pcolor lime ]
+    ; Two wide exits at the back (bottom)
+    ; Bottom-left exit
+    if (pycor = -16 and pxcor >= start-px-bot-left1 and pxcor <= end-px-bot-left1) [ set pcolor lime ]
+    ; Bottom-right exit
+    if (pycor = -16 and pxcor >= start-px-bot-right1 and pxcor <= end-px-bot-right1) [ set pcolor lime ]
+  ]
+
+  if lecture-hall-layout = "side-exits-hall" [
+    ; Exits at the middle of left and right walls
+    let mid-y-start 0
+    let mid-y-end 0
+
+    ; Correctly calculate start and end points for both ODD and EVEN widths
+    ifelse (exit-width mod 2 = 1) [
+      let half-width floor(exit-width / 2)
+      set mid-y-start (-1 * half-width)
+      set mid-y-end half-width
+    ] [
+      let half-width (exit-width / 2)
+      set mid-y-start (-1 * half-width)
+      set mid-y-end (half-width - 1)
+    ]
+
+    if (pxcor = -14 and pycor >= mid-y-start and pycor <= mid-y-end) [ set pcolor lime ]
+    if (pxcor = 14 and pycor >= mid-y-start and pycor <= mid-y-end) [ set pcolor lime ]
+  ]
+  ; --- END NEW/MODIFIED LAYOUTS ---
+
+  ; --- SEATING AND AISLE LOGIC ---
+  let bench-rows [-13 -11 -9 -7 -5 -3 -1 1 3 5 7 9 11]
+  let seating-width 11
+  if lecture-hall-layout = "wide-auditorium" [ set seating-width 18 ]
+
+  if member? pycor bench-rows and (abs pxcor <= seating-width) [
+    if lecture-hall-layout = "center-side-aisle" [
+      if not (pxcor >= -1 and pxcor <= 1) [ set pcolor 35 ]
+    ]
+    if lecture-hall-layout = "center-aisle-only" [
+      ; Leave center aisle clear (3 patches wide)
+      if not (pxcor >= -1 and pxcor <= 1) [
+        set pcolor 35
+      ]
+    ]
+    if lecture-hall-layout = "traditional" [
+      set pcolor 35
+    ]
+    if lecture-hall-layout = "tiered" [
+      set pcolor 35
+      let row-num position pycor bench-rows
+      set tier-level (ifelse-value (row-num != false) [row-num + 1] [0])
+    ]
+    ; --- NEW/MODIFIED SEATING ---
+    if lecture-hall-layout = "wide-auditorium" [
+      if not ( (pxcor >= -8 and pxcor <= -7) or (pxcor >= 7 and pxcor <= 8) ) [
+        set pcolor 35
+      ]
+    ]
+    if lecture-hall-layout = "side-exits-hall" [
+      ; No center aisle, just side aisles
+      set pcolor 35
+    ]
+    ; --- END NEW/MODIFIED SEATING ---
+  ]
+
+  ; Mark professor's area in front
+  let prof-area-width 6
+  if lecture-hall-layout = "wide-auditorium" [ set prof-area-width 10 ]
+  ask patches with [pycor >= 13 and pycor <= 15 and abs pxcor <= prof-area-width] [
+    set pcolor 38
+  ]
+  ask patches with [pycor = 13 and abs pxcor <= 2] [
+    set pcolor 35
+  ]
+end
+
+; Set up the fire alarm
+to setup-alarm
+  ask patch 11 15 [
+    set pcolor white
+    set is-alarm? true
+  ]
+  set alarm-patch patch 11 15
+end
+
+; Mark patches as walkable or not
+to setup-walkable-patches
+  ask patches [
+    set walkable? (pcolor != black and pcolor != 35 and not is-alarm?)
+    set congestion-count 0
+    set total-traffic 0
+    ifelse (pcolor = 35 and lecture-hall-layout = "tiered")
+      [ set tier-level (ifelse-value (member? pycor [-13 -11 -9 -7 -5 -3 -1 1 3 5 7 9 11])
+        [position pycor [-13 -11 -9 -7 -5 -3 -1 1 3 5 7 9 11] + 1] [0]) ]
+      [ set tier-level 0 ]
+  ]
+end
+
+; Set up stairs/aisles based on layout
+to setup-stairs
+  ; First, ensure all patches are reset to not be stairs
+  ask patches [ set is-stair? false ]
+  set stair-patches no-patches
+
+  ; Define stair aisles for the "tiered" layout
+  if lecture-hall-layout = "tiered" [
+    ask patches with [
+      ( (pxcor = -13 or pxcor = -12) or (pxcor = 12 or pxcor = 13) )
+      and (pycor <= 11 and pycor >= -13)
+    ] [
+      set is-stair? true
+    ]
+  ]
+
+  ; Define stair aisles for the "center-side-aisle" layout
+  if lecture-hall-layout = "center-side-aisle" [
+    ask patches with [
+      ( (pxcor = -13 or pxcor = -12) or (pxcor = 12 or pxcor = 13) or (pxcor >= -1 and pxcor <= 1) )
+      and (pycor <= 11 and pycor >= -13)
+    ] [
+      set is-stair? true
+    ]
+  ]
+
+  if lecture-hall-layout = "center-aisle-only" [
+    ; Only the center aisle is marked as stairs/aisle
+    ask patches with [
+      (pxcor >= -1 and pxcor <= 1) and (pycor <= 11 and pycor >= -13)
+    ] [
+      set is-stair? true
+    ]
+  ]
+
+  ; --- NEW/MODIFIED STAIRS FOR NEW/MODIFIED LAYOUTS ---
+  if lecture-hall-layout = "wide-auditorium" [
+    ask patches with [
+      ( (pxcor = -20 or pxcor = -19) or (pxcor = 19 or pxcor = 20) or (pxcor >= -8 and pxcor <= -7) or (pxcor >= 7 and pxcor <= 8) )
+      and (pycor <= 11 and pycor >= -13)
+    ] [
+      set is-stair? true
+    ]
+  ]
+
+  if lecture-hall-layout = "side-exits-hall" [
+    ask patches with [
+      ( (pxcor = -13 or pxcor = -12) or (pxcor = 12 or pxcor = 13) )
+      and (pycor <= 11 and pycor >= -13)
+    ] [
+      set is-stair? true
+    ]
+  ]
+  ; --- END NEW/MODIFIED STAIRS ---
+
+  ; Finally, collect all patches marked as stairs into the global patch-set
+  set stair-patches patches with [ is-stair? = true ]
+end
+
+; Calculate visibility of exits from each patch
+to calculate-exit-visibility
+  ask patches with [walkable?] [
+    ; Simple visibility model: decreases with distance and obstacles
+    let nearest-exit min-one-of exit-patches [distance myself]
+    if nearest-exit != nobody [
+      let dist distance nearest-exit
+      set exit-visibility max (list 0 (1 - dist / 30))
+    ]
+  ]
+end
+
+; Place students randomly on valid seats
+to allocate-students
+  set color white
+  set size 1
+  let bench-rows [-13 -11 -9 -7 -5 -3 -1 1 3 5 7 9 11]
+
+  ; Try to find an empty seat
+  let attempts 0
+  loop [
+    let target-y one-of bench-rows
+    let target-x (random (2 * max-pxcor + 1)) - max-pxcor
+    setxy target-x target-y
+    if (patch-here != nobody and [pcolor] of patch-here = 35 and not any? other turtles-here) or attempts > 100 [ stop ]
+    set attempts attempts + 1
+  ]
+end
+
+; Assign evacuation strategy to turtle
+to assign-evacuation-strategy
+  ifelse evacuation-behavior = "mixed-population"
+  [
+    ; Realistic distribution based on evacuation research
+    let strategy-choice random 100
+    ifelse strategy-choice < 50
+      [ set evacuation-strategy "follow-others" ]     ; 50% - most common behavior
+      [ ifelse strategy-choice < 75
+        [ set evacuation-strategy "nearest-exit" ]    ; 25% - rational evacuees
+        [ ifelse strategy-choice < 90
+          [ set evacuation-strategy "calm-and-orderly" ] ; 15% - trained/calm
+          [ set evacuation-strategy "panic-rush" ]    ; 10% - panicked
+        ]
+      ]
+  ]
+  [ set evacuation-strategy evacuation-behavior ]
+end
+
+; Set strategy-specific parameters based on research data
+to set-strategy-parameters
+  ; This procedure now sets a UNIQUE speed for each turtle based on its strategy and condition.
+  ; Variation is introduced using random-normal distribution where applicable.
+
+  if is-impaired? [
+    ; Use the specified speed for impaired agents (0.42 m/s).
+    set base-speed impaired-walking-speed
+    ; Add slight variation
+    set base-speed random-normal base-speed (base-speed * 0.15)
+    if base-speed < 0.1 [ set base-speed 0.1 ]
+
+    ; Set other parameters and then stop this procedure for this agent
+    set desired-speed base-speed
+    set actual-speed 0
+    stop
+  ]
+
+  ; For non-impaired agents, assign speeds based on their strategy
+  if evacuation-strategy = "panic-rush" [
+    set base-speed random-normal average-evacuation-speed (average-evacuation-speed * 0.2)
+    set personal-space-radius 0.5
+    set patience-level patience-level * 0.3
+  ]
+  if evacuation-strategy = "calm-and-orderly" [
+    set base-speed random-normal average-evacuation-speed (average-evacuation-speed * 0.15)
+    set personal-space-radius 1.5
+    set patience-level patience-level * 1.5
+  ]
+  if evacuation-strategy = "follow-others" [
+    set base-speed random-normal average-evacuation-speed (average-evacuation-speed * 0.2)
+    set personal-space-radius 1.0
+  ]
+  if evacuation-strategy = "nearest-exit" [
+    set base-speed random-normal unimpeded-walking-speed (unimpeded-walking-speed * 0.2)
+    set personal-space-radius 1.0
+    set patience-level patience-level * 1.2
+  ]
+
+  if base-speed < 0.1 [ set base-speed 0.1 ]
+
+  set desired-speed base-speed
+  set actual-speed 0
+end
+
+; Calculate distance from each patch to nearest exit (BFS)
+to calculate-exit-distances
+  ask patches [
+    ifelse walkable? [
+      set distance-from-exit 999999
+    ] [
+      set distance-from-exit -1
+    ]
+    set visited? false
+    set parent-patch nobody
+  ]
+  let queue []
+  ask exit-patches with [not blocked?] [
+    set distance-from-exit 0
+    set visited? true
+    set queue lput self queue
+  ]
+  while [length queue > 0] [
+    let current-patch first queue
+    set queue but-first queue
+    ask current-patch [
+      let current-distance distance-from-exit
+      ask neighbors [
+        if walkable? and not visited? [
+          set visited? true
+          set distance-from-exit current-distance + 1
+          set parent-patch current-patch
+          set queue lput self queue
+        ]
+      ]
+    ]
+  ]
+end
+
+; Toggle exit blockage
+to toggle-exit-block
+  ; Find a random exit to block/unblock
+  if any? exit-patches [
+    ask one-of exit-patches [
+      ifelse blocked? [
+        ; Unblock the exit
+        set blocked? false
+        set pcolor lime
+        output-print (word "Exit at (" pxcor "," pycor ") UNBLOCKED")
+      ] [
+        ; Block the exit
+        set blocked? true
+        set pcolor orange
+        output-print (word "Exit at (" pxcor "," pycor ") BLOCKED")
+      ]
+    ]
+    ; Recalculate distances with new blockage status
+    calculate-exit-distances
+  ]
+end
+
+; ========================================================================
+; MAIN RUNTIME PROCEDURES
+; ========================================================================
+
+; Update exit throughput budgets each tick
+to update-exit-budgets
+  let cap_per_patch_per_tick (exit-capacity-per-meter * patch-size-meters * seconds-per-tick)
+  ask exit-patches with [not blocked?] [
+    set exit-throughput-budget exit-throughput-budget + cap_per_patch_per_tick
+    if exit-throughput-budget > 3 [ set exit-throughput-budget 3 ]  ; optional cap to avoid runaway
+  ]
+end
+
+; Main simulation loop
+to go
+  ; Update current time
+  set current-time ticks * seconds-per-tick
+
+  ; Check if fire alarm should sound
+  if current-time >= (alarm-time * seconds-per-tick) and not alarm-sounded? [
+    sound-fire-alarm
+  ]
+
+  ; Update environment
+  update-alarm-effect
+  update-patch-density
+  update-patch-turtle-status
+  update-exit-budgets  ; NEW: per-exit capacity accumulation
+
+  ; Update agent states
+  if alarm-sounded? [
+    update-panic-levels
+    update-colors
+    detect-and-form-groups  ; For herding behavior
+  ]
+
+  collect-congestion-data
+  track-movement
+
+  ; Periodic check for severely stuck turtles
+  if ticks mod 50 = 0 [  ; Check every 5 seconds (50 ticks * 0.1 seconds)
+    check-global-stuck-status
+  ]
+
+  ; Mark evacuation start
+  if not evacuation-started? and alarm-sounded? and any? turtles with [stood-up?] [
+    set evacuation-started? true
+    set evacuation-start-time current-time
+  ]
+
+  ; Agent behavior execution
+  ask turtles [
+    if recalc-path-timer > 0 [ set recalc-path-timer recalc-path-timer - seconds-per-tick ]
+
+    ; Check if can see exits
+    update-exit-visibility
+
+    ; React to alarm with individual delay
+    if alarm-sounded? and (current-time - alarm-sound-time) >= individual-reaction-delay [
+      if not stood-up? [
+        attempt-to-stand-up
+      ]
+      if stood-up? [
+        ; Choose exit if not chosen
+        if chosen-exit = nobody [
+          choose-exit-strategy
+        ]
+
+        ; Execute movement based on strategy
+        execute-evacuation-movement
+      ]
+    ]
+
+    ; Update stuck time tracking
+    if stood-up? [
+      ifelse actual-speed < 0.01 [  ; Essentially not moving
+        set stuck-time stuck-time + seconds-per-tick
+      ] [
+        set stuck-time max (list 0 (stuck-time - seconds-per-tick))
+      ]
+    ]
+  ]
+
+  ; Update average panic level
+  if any? turtles with [not is-professor?] and alarm-sounded? [
+    set avg-panic-level mean [panic-level] of turtles with [not is-professor?]
+  ]
+
+  ; Stop simulation when all evacuated
+  if not any? turtles [
+    set evacuation-end-time current-time
+    set last-exit-time current-time
+    set total-evacuation-time evacuation-end-time - evacuation-start-time
+    finalize-statistics
+    stop
+  ]
+
+  tick
+end
+
+; Sound the fire alarm
+to sound-fire-alarm
+  set alarm-sounded? true
+  set alarm-sound-time current-time
+  output-print ""
+  output-print (word "FIRE ALARM ACTIVATED AT " (format-time current-time) " ")
+  output-print ""
+
+  ; Realistic panic increase - varies by individual
+  ask turtles with [not is-professor?] [
+    let panic-increase 20 + random 30  ; 20-50 increase
+    if evacuation-strategy = "panic-rush" [ set panic-increase panic-increase * 1.5 ]
+    if evacuation-strategy = "calm-and-orderly" [ set panic-increase panic-increase * 0.5 ]
+    set panic-level min (list 100 (panic-level + panic-increase))
+  ]
+
+  ask professor [
+    set panic-level min (list 100 (panic-level + 10))
+  ]
+end
+
+; Update alarm visual effect
+to update-alarm-effect
+  if alarm-sounded? [
+    ask alarm-patch [
+      ifelse (floor (current-time * 2)) mod 2 = 0
+        [ set pcolor red ]
+        [ set pcolor yellow ]
+    ]
+  ]
+end
+
+; Update density levels on patches
+to update-patch-density
+  ask patches with [walkable?] [
+    set density-level count turtles in-radius 2
+  ]
+end
+
+; ========================================================================
+; MOVEMENT & BEHAVIOR PROCEDURES
+; ========================================================================
+
+; Attempt to stand up from seat
+to attempt-to-stand-up
+  if not alarm-sounded? [ stop ]
+  if (current-time - alarm-sound-time) < individual-reaction-delay [ stop ]
+
+  ; If already stood up but still on seat, force escape
+  if stood-up? and [pcolor] of patch-here = 35 [
+    escape-from-seat
+    stop
+  ]
+
+  ; Calculate stand-up probability based on multiple factors
+  let stand-up-probability 0
+
+  ; Base probability by strategy
+  if evacuation-strategy = "panic-rush" [ set stand-up-probability 95 ]
+  if evacuation-strategy = "calm-and-orderly" [ set stand-up-probability 70 ]
+  if evacuation-strategy = "nearest-exit" [ set stand-up-probability 85 ]
+  if evacuation-strategy = "follow-others" [
+    ; Social influence - more likely if others are standing
+    let standing-neighbors count other turtles in-radius 3 with [stood-up?]
+    let total-neighbors count other turtles in-radius 3
+    ifelse total-neighbors > 0
+      [ set stand-up-probability 40 + (standing-neighbors / total-neighbors) * 60 ]
+      [ set stand-up-probability 40 ]
+  ]
+
+  ; Increase with panic
+  set stand-up-probability stand-up-probability + (panic-level * 0.1)
+
+  ; Ensure within bounds
+  set stand-up-probability min (list 100 stand-up-probability)
+
+  if random-float 100 < stand-up-probability [
+    escape-from-seat
+  ]
+end
+
+; New procedure to escape from seat (prioritize nearest aisle/stair patches, remove directional bias)
+to escape-from-seat
+  ; Candidate walkable patches near the seat
+  let nearby patches in-radius 2 with [
+    walkable? and
+    pcolor != 35 and
+    pcolor != black and
+    count turtles-here < 2
+  ]
+
+  if any? nearby [
+    ; Prefer aisle/stair patches to get into the flow
+    let aisle nearby with [is-stair?]
+    let candidate ifelse-value any? aisle [aisle] [nearby]
+    ; Choose patch that reduces distance to exit and is less crowded
+    let chosen-patch min-one-of candidate [
+      distance-from-exit + (count turtles-here)
+    ]
+    if chosen-patch != nobody [
+      move-to chosen-patch
+      set stood-up? true
+      set time-stood-up current-time
+      if any? (exit-patches with [not blocked?]) [
+        face min-one-of (exit-patches with [not blocked?]) [distance myself]
+      ]
+    ]
+  ]
+end
+
+; Line-of-sight reporter for exit visibility (fixed: use pxcor/pycor for patch target)
+to-report has-line-of-sight? [target]
+  if target = nobody [ report false ]
+  let dist distance target
+  if dist <= 0 [ report true ]
+
+  let step-len 0.25                      ; sample every ~0.25 m
+  let steps max list 1 ceiling ((dist * patch-size-meters) / step-len)
+
+  ; cache target patch coordinates (patches have pxcor/pycor, not xcor/ycor)
+  let tx [pxcor] of target
+  let ty [pycor] of target
+
+  let ok true
+  let i 1
+  while [i < steps and ok] [
+    let frac i / steps
+    ; xcor/ycor here refer to the calling turtle (valid in turtle context)
+    let x (xcor + frac * (tx - xcor))
+    let y (ycor + frac * (ty - ycor))
+    let p patch x y
+    if p != nobody [
+      let c [pcolor] of p
+      ; benches (35) and walls (black) block line of sight
+      if (c = 35) or (c = black) [
+        set ok false
+      ]
+    ]
+    set i i + 1
+  ]
+  report ok
+end
+
+; Update visibility of exits for turtle (use line-of-sight)
+to update-exit-visibility
+  set exit-visible? false
+  let candidates exit-patches with [not blocked?]
+  if any? candidates [
+    let nearest min-one-of candidates [distance myself]
+    if nearest != nobody and distance nearest < 20 and has-line-of-sight? nearest [
+      set exit-visible? true
+    ]
+  ]
+end
+
+; Add periodic check for stuck turtles in the main go procedure
+to check-global-stuck-status
+  ; Find turtles that have been stuck for too long
+  let severely-stuck turtles with [
+    stood-up? and
+    stuck-time > 15 and  ; Stuck for 15 seconds
+    [pcolor] of patch-here = 35  ; Still on seat
+  ]
+
+  if any? severely-stuck [
+    ask severely-stuck [
+      ; Force teleport to nearest walkable patch as last resort
+      let emergency-patches patches in-radius 5 with [
+        walkable? and
+        pcolor != black and
+        pcolor != 35 and
+        count turtles-here < 2
+      ]
+
+      if any? emergency-patches [
+        let emergency-patch min-one-of emergency-patches [distance-from-exit]
+        move-to emergency-patch
+        set stuck-time 0
+        set path-to-exit []
+        set recalc-path-timer 0
+        output-print (word "WARNING: Force-moved stuck turtle from seat at tick " ticks)
+      ]
+    ]
+  ]
+end
+
+; Choose which exit to head towards
+to choose-exit-strategy
+  ; Different strategies for choosing exits
+  ; Filter out blocked exits
+  let available-exits exit-patches with [not blocked?]
+
+  if not any? available-exits [
+    ; If all exits are blocked, panic increases dramatically
+    set panic-level min (list 100 (panic-level + 30))
+    stop
+  ]
+
+  if evacuation-strategy = "nearest-exit" or is-professor? [
+    ; Choose nearest visible exit
+    set chosen-exit min-one-of available-exits [distance myself]
+  ]
+
+  if evacuation-strategy = "panic-rush" [
+    ; Choose nearest exit but may change if blocked
+    set chosen-exit min-one-of available-exits [distance myself]
+  ]
+
+  if evacuation-strategy = "calm-and-orderly" [
+    ; Choose least congested exit if familiar, otherwise nearest
+    ifelse familiar? [
+      ; Evaluate exits based on distance and congestion
+      let exit-options []
+      ask available-exits [
+        let exit-score distance myself + (count turtles in-radius 5) * 3
+        set exit-options lput (list self exit-score) exit-options
+      ]
+      let best-exit first (min-by-second exit-options)
+      set chosen-exit best-exit
+    ] [
+      set chosen-exit min-one-of available-exits [distance myself]
+    ]
+  ]
+
+  if evacuation-strategy = "follow-others" [
+    ; Follow group's exit choice
+    if following-group? and length group-members > 0 [
+      let group-exits []
+      ask turtle-set group-members [
+        if chosen-exit != nobody and not [blocked?] of chosen-exit [
+          set group-exits lput chosen-exit group-exits
+        ]
+      ]
+      if length group-exits > 0 [
+        ; Find most popular exit
+        let exit-counts table:make
+        foreach group-exits [ exit ->
+          let exit-key (word [pxcor] of exit "," [pycor] of exit)
+          ifelse table:has-key? exit-counts exit-key
+            [ table:put exit-counts exit-key (table:get exit-counts exit-key + 1) ]
+            [ table:put exit-counts exit-key 1 ]
+        ]
+
+        let best-count 0
+        let best-exit-key ""
+        foreach table:keys exit-counts [ k ->
+          if table:get exit-counts k > best-count [
+            set best-count table:get exit-counts k
+            set best-exit-key k
+          ]
+        ]
+
+        ; Convert back to patch (FIXED)
+        if best-exit-key != "" [
+          let comma-pos position "," best-exit-key
+          if comma-pos != false [
+            let x-str substring best-exit-key 0 comma-pos
+            let y-str substring best-exit-key (comma-pos + 1) (length best-exit-key)
+            set chosen-exit patch (read-from-string x-str) (read-from-string y-str)
+          ]
+        ]
+      ]
+    ]
+    ; If no group or group has no exit, choose nearest
+    if chosen-exit = nobody [
+      set chosen-exit min-one-of available-exits [distance myself]
+    ]
+  ]
+end
+
+; Main evacuation movement execution
+to execute-evacuation-movement
+  ; Check if still on seat and escape
+  if [pcolor] of patch-here = 35 [
+    escape-from-seat
+    stop
+  ]
+
+  ; Check if at exit with capacity gating
+  if pcolor = lime and not [blocked?] of patch-here [
+    ifelse [exit-throughput-budget] of patch-here >= 1 [
+      ask patch-here [ set exit-throughput-budget exit-throughput-budget - 1 ]
+      record-evacuation
+      die
+    ] [
+      ; queue upstream: slow down near door
+      set desired-speed min list desired-speed (average-evacuation-speed * 0.2)
+    ]
+    stop
+  ]
+
+  ; Update desired speed based on panic and congestion
+  update-desired-speed
+
+  ; Execute strategy-specific behavior
+  if evacuation-strategy = "follow-others" [
+    execute-herding-behavior
+  ]
+
+  if evacuation-strategy = "calm-and-orderly" [
+    execute-orderly-behavior
+  ]
+
+  if evacuation-strategy = "panic-rush" [
+    execute-panic-behavior
+  ]
+
+  if evacuation-strategy = "nearest-exit" [
+    execute-rational-behavior
+  ]
+
+  ; Calculate path if needed
+  if length path-to-exit = 0 or recalc-path-timer <= 0 [
+    calculate-bfs-path
+  ]
+
+  ; Move along path
+  if length path-to-exit > 0 [
+    move-along-path
+  ]
+
+  ; Handle stuck situations
+  if stuck-time > 3 [  ; Stuck for 3 seconds
+    handle-stuck-situation
+  ]
+end
+
+; Update desired speed based on conditions (modified for stairs and fundamental diagram)
+to update-desired-speed
+  ; Apply stair modifier to base capability
+  let current-base-speed base-speed
+  if patch-here != nobody and [is-stair?] of patch-here [
+    set current-base-speed current-base-speed * stair-speed-modifier
+  ]
+
+  set desired-speed current-base-speed
+
+  ; Increase speed with panic (not for professor)
+  if not is-professor? and panic-level > 50 [
+    set desired-speed desired-speed * (1 + (panic-level - 50) / 100)
+  ]
+
+  ; Directionality on tiers (ascending slower, descending slightly faster)
+  if lecture-hall-layout = "tiered" and patch-here != nobody [
+    let tier-here [tier-level] of patch-here
+    let d (tier-here - current-tier)
+    if d < 0 [ set desired-speed desired-speed * 1.05 ] ; descending
+    if d > 0 [ set desired-speed desired-speed * 0.90 ] ; ascending
+  ]
+
+  ; Cap speed relative to average evac speed
+  let max-speed average-evacuation-speed * 1.5
+  if patch-here != nobody and [is-stair?] of patch-here [
+    set max-speed max-speed * stair-speed-modifier
+  ]
+  set desired-speed min (list desired-speed max-speed)
+
+  ; Speed–density relation using persons/m^2
+  let r 2
+  let neigh turtles in-radius r
+  let area (pi * (r * patch-size-meters) ^ 2)
+  let rho (ifelse-value (area > 0) [ count neigh / area ] [ 0 ])
+  let rho_jam 5.4
+  let factor max list 0 (1 - (rho / rho_jam))
+  set desired-speed desired-speed * factor
+end
+
+
+; ========================================================================
+; HERDING BEHAVIOR IMPLEMENTATION
+; ========================================================================
+
+; Detect and form groups for herding behavior
+to detect-and-form-groups
+  ; Only for turtles using follow-others strategy
+  ask turtles with [evacuation-strategy = "follow-others" and stood-up?] [
+    ; Clean up invalid group members first
+    if following-group? [
+      set group-members filter [m -> is-turtle? m] group-members
+      if length group-members < 2 [
+        set following-group? false
+        set group-members []
+      ]
+    ]
+
+    ; Look for nearby groups to join
+    let nearby-groups other turtles in-radius 3 with [
+      evacuation-strategy = "follow-others" and
+      following-group? and
+      length group-members > 2
+    ]
+
+    ifelse any? nearby-groups [
+      ; Join largest nearby group
+      let best-group max-one-of nearby-groups [length group-members]
+      set following-group? true
+      set group-members [group-members] of best-group
+      set group-members lput self group-members
+
+      ; Adopt group's exit choice
+      set chosen-exit [chosen-exit] of best-group
+
+      ; Align heading with group
+      let group-turtle-set turtle-set ([group-members] of best-group)
+      if any? group-turtle-set [
+        let avg-heading mean [heading] of group-turtle-set
+        set heading avg-heading
+      ]
+    ] [
+      ; Try to form new group
+      let potential-members other turtles in-radius 2 with [
+        evacuation-strategy = "follow-others" and
+        not following-group?
+      ]
+
+      if count potential-members >= 2 [
+        set following-group? true
+        set group-members (list self)
+        ask potential-members [
+          set following-group? true
+          set group-members [group-members] of myself
+        ]
+        let member-list []
+        ask potential-members [
+          set member-list lput self member-list
+        ]
+        set group-members sentence group-members member-list
+      ]
+    ]
+  ]
+end
+
+; --- REFINED: Herding behavior based on local group dynamics rather than a single leader.
+to execute-herding-behavior
+  ; Find nearby turtles to consider as the local "herd"
+  let herd other turtles in-radius 4 with [stood-up?]
+
+  if any? herd [
+    ; Alignment to herd
+    let avg-herd-heading mean [heading] of herd
+    set heading heading + 0.5 * (subtract-headings avg-herd-heading heading)
+
+    ; Cohesion
+    let avg-herd-x mean [xcor] of herd
+    let avg-herd-y mean [ycor] of herd
+    if distancexy avg-herd-x avg-herd-y > personal-space-radius [
+      face patch avg-herd-x avg-herd-y
+    ]
+
+    ; Separation
+    let too-close-turtles herd in-radius personal-space-radius
+    if any? too-close-turtles [
+      let nearest-neighbor min-one-of too-close-turtles [distance myself]
+      if nearest-neighbor != nobody [
+        face nearest-neighbor
+        rt 180
+      ]
+    ]
+
+    ; Match speed
+    set desired-speed (mean [desired-speed] of herd)
+  ]
+end
+
+
+; Execute calm and orderly evacuation behavior
+to execute-orderly-behavior
+  ; Maintain personal space
+  let too-close other turtles in-radius personal-space-radius
+  if any? too-close [
+    let valid-neighbors too-close with [xcor != [xcor] of myself or ycor != [ycor] of myself]
+    if any? valid-neighbors [
+      let nearest min-one-of valid-neighbors [distance myself]
+      let avoid-heading atan (xcor - [xcor] of nearest) (ycor - [ycor] of nearest)
+      set heading avoid-heading
+    ]
+  ]
+
+  ; Respect queue formation at exits
+  let exit-ahead patches in-cone 3 60 with [pcolor = lime and not blocked?]
+  if any? exit-ahead [
+    ; Check for queue
+    let queue-agents turtles in-radius 3 with [
+      evacuation-strategy = "calm-and-orderly" and
+      distance one-of exit-ahead < [distance one-of exit-ahead] of myself
+    ]
+
+    if count queue-agents > 2 [
+      ; Slow down to maintain order
+      set desired-speed base-speed * 0.6
+
+      ; Align with queue direction if possible
+      if any? queue-agents [
+        let queue-heading mean [heading] of queue-agents
+        set heading heading + 0.3 * (subtract-headings queue-heading heading)
+      ]
+    ]
+  ]
+
+  ; Adjust speed based on visibility and congestion
+  let visible-congestion count turtles in-cone 5 60
+  set desired-speed base-speed * (1 - visible-congestion / 15)
+  set desired-speed max list desired-speed (average-evacuation-speed * 0.4)
+
+  ; Help others if leader/familiar
+  if familiar? and panic-level < 30 [
+    let panicked-nearby turtles in-radius 3 with [panic-level > 70]
+    if any? panicked-nearby [
+      ask panicked-nearby [
+        set panic-level panic-level * 0.95
+      ]
+    ]
+  ]
+end
+
+; Execute panic behavior
+to execute-panic-behavior
+  ; Panic increases over time
+  set panic-level min (list 100 (panic-level + random-float 2))
+
+  ; Erratic movement when panicked
+  if panic-level > 70 [
+    rt random 60 - 30  ; Random turning
+    set desired-speed base-speed * 1.5  ; Try to move faster
+  ]
+
+  ; Crowd pressure effects
+  let nearby-panicked count turtles in-radius 2 with [panic-level > 60]
+  if nearby-panicked > 3 [
+    ; Try to escape crowd
+    let crowded-spots turtles in-radius 2
+    if any? crowded-spots [
+      let avg-x mean [xcor] of crowded-spots
+      let avg-y mean [ycor] of crowded-spots
+
+      ifelse xcor != avg-x or ycor != avg-y [
+        let escape-heading atan (xcor - avg-x) (ycor - avg-y)
+        set heading escape-heading
+      ] [
+        set heading random 360
+      ]
+    ]
+  ]
+
+  ; May freeze in extreme panic
+  if panic-level > 90 and random 100 < 10 [
+    set desired-speed 0.1
+  ]
+
+  ; Contagion effect
+  let nearby-calm count turtles in-radius 3 with [panic-level < 30]
+  if nearby-calm > 5 [
+    set panic-level panic-level * 0.95  ; Slightly calm down
+  ]
+end
+
+; Execute rational evacuation behavior
+to execute-rational-behavior
+  ; Evaluate current path efficiency
+  if recalc-path-timer <= 0 [
+    let current-path-cost length path-to-exit + congestion-encounters * 5
+
+    ; Check if another exit might be better
+    if familiar? [
+      let available-exits exit-patches with [not blocked?]
+      let alternative-costs []
+      ask available-exits [
+        let dist distance myself
+        let congestion count turtles in-radius 5
+        let cost dist + congestion * 3
+        set alternative-costs lput (list self cost) alternative-costs
+      ]
+
+      if length alternative-costs > 0 [
+        let best-alternative-item min-by-second alternative-costs
+        if length best-alternative-item > 0 [
+          let best-alternative first best-alternative-item
+          let best-cost item 1 best-alternative-item
+
+          if best-cost < current-path-cost * 0.7 [  ; Switch if significantly better
+            set chosen-exit best-alternative
+            set path-to-exit []
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  ; Adjust speed based on congestion
+  let local-congestion count turtles in-radius 2
+  set desired-speed base-speed * (1 - local-congestion / 10)
+  set desired-speed max list desired-speed (average-evacuation-speed * 0.5)
+end
+
+; Move along calculated path
+to move-along-path
+  if current-path-index >= length path-to-exit [
+    set recalc-path-timer 0
+    calculate-bfs-path
+    stop
+  ]
+
+  let target-patch item current-path-index path-to-exit
+
+  ; Check if target is still valid
+  if not is-patch-accessible? target-patch [
+    set stuck-time stuck-time + seconds-per-tick
+    if stuck-time > 1 [
+      set recalc-path-timer 0
+      calculate-bfs-path
+    ]
+    stop
+  ]
+
+  if patch-here != target-patch [
+    face target-patch
+  ]
+
+  let distance-to-target distance target-patch
+  let move-distance min (list desired-speed distance-to-target)
+
+  let old-location (list xcor ycor)
+
+  ; Try to move if not already at target
+  if distance-to-target > 0.01 [
+    ; Check if movement path is clear
+    let can-move-safely? true
+
+    ; Check multiple points along the path for walls
+    let check-distance 0.1
+    let checks ceiling (move-distance / check-distance)
+    let i 1
+    while [i <= checks and can-move-safely?] [
+      let check-dist min (list (i * check-distance) move-distance)
+      let ahead-patch patch-ahead check-dist
+      if ahead-patch != nobody and [pcolor] of ahead-patch = black [
+        set can-move-safely? false
+      ]
+      set i i + 1
+    ]
+
+    ; If path is clear, move
+    ifelse can-move-safely? [
+      ifelse can-move? move-distance [
+        fd move-distance
+      ] [
+        ; Try smaller distance
+        let small-dist move-distance * 0.5
+        if can-move? small-dist [
+          fd small-dist
+        ]
+      ]
+    ] [
+      ; Path blocked, need to recalculate
+      set stuck-time stuck-time + seconds-per-tick
+      set recalc-path-timer 0
+    ]
+  ]
+
+  ; Record actual movement
+  let new-location (list xcor ycor)
+  let actual-distance sqrt ((item 0 new-location - item 0 old-location) ^ 2 +
+                           (item 1 new-location - item 1 old-location) ^ 2)
+  set actual-speed actual-distance
+  set distance-traveled distance-traveled + actual-distance
+
+  ; Update path progress
+  if distance target-patch < 0.5 [
+    set current-path-index current-path-index + 1
+    set stuck-time 0
+  ]
+
+  ; Check for congestion
+  if actual-speed < desired-speed * 0.5 [
+    set congestion-encounters congestion-encounters + 1
+  ]
+end
+
+; Improved stuck situation handler
+to handle-stuck-situation
+  ; First check if on seat
+  if [pcolor] of patch-here = 35 [
+    set stuck-time stuck-time + seconds-per-tick
+    escape-from-seat
+    set path-to-exit []
+    set recalc-path-timer 0
+    stop
+  ]
+
+  ; Increase panic when stuck
+  set panic-level min (list 100 (panic-level + 5))
+
+  ; Try different escape strategies
+  ; 1. Random walk with wall and seat avoidance
+  if stuck-time > 3 and stuck-time <= 5 [
+    let attempts 0
+    let moved? false
+    while [attempts < 8 and not moved?] [
+      rt (random 180) - 90
+      if can-move? 0.5 [
+        let dest patch-ahead 0.5
+        if dest != nobody and
+           [pcolor] of dest != black and
+           [pcolor] of dest != 35 and
+           [walkable?] of dest [
+          fd 0.5
+          set moved? true
+          set stuck-time 0
+        ]
+      ]
+      set attempts attempts + 1
+    ]
+  ]
+
+  ; 2. Backtrack with checks
+  if stuck-time > 5 and stuck-time <= 7 [
+    rt 180
+    if can-move? 1 [
+      let dest patch-ahead 1
+      if dest != nobody and
+         [pcolor] of dest != black and
+         [pcolor] of dest != 35 and
+         [walkable?] of dest [
+        fd 1
+        set stuck-time stuck-time * 0.5
+      ]
+    ]
+  ]
+
+  ; 3. Find any free space (expanded search)
+  if stuck-time > 7 [
+    let search-radius 3
+    if stuck-time > 10 [ set search-radius 5 ]
+
+    let free-patches patches in-radius search-radius with [
+      walkable? and
+      count turtles-here < 2 and
+      pcolor != black and
+      pcolor != 35
+    ]
+
+    if any? free-patches [
+      let target-free-patch min-one-of free-patches [distance-from-exit]
+
+      ; Try to move towards the free patch step by step
+      face target-free-patch
+      let step-size 0.5
+      let steps-needed ceiling (distance target-free-patch / step-size)
+
+      repeat steps-needed [
+        if can-move? step-size [
+          let next-patch patch-ahead step-size
+          if next-patch != nobody and
+             [pcolor] of next-patch != black and
+             [pcolor] of next-patch != 35 [
+            fd step-size
+          ]
+        ]
+      ]
+
+      if distance target-free-patch < 1 [
+        set stuck-time 0
+        set recalc-path-timer 0
+      ]
+    ]
+  ]
+
+  ; Force recalculation
+  set path-to-exit []
+  set recalc-path-timer 0
+end
+
+; Check if patch is accessible with realistic per-patch occupancy
+to-report is-patch-accessible? [target-patch]
+  if target-patch = nobody [ report false ]
+  if not [walkable?] of target-patch [ report false ]
+  if [pcolor] of target-patch = black [ report false ]
+  if [pcolor] of target-patch = 35 [ report false ]
+
+  ; Per-patch occupancy limit (patch is 0.25 m^2). 1 person/patch ≈ 4 p/m^2.
+  let occupancy count turtles-on target-patch
+  let max-occupancy 1
+  if evacuation-strategy = "panic-rush" [
+    set max-occupancy 2  ; allow tighter packing only for panic
+  ]
+
+  report occupancy < max-occupancy
+end
+
+; ========================================================================
+; PANIC AND SOCIAL INFLUENCE
+; ========================================================================
+
+; Update panic levels based on contagion and situation (Tuned Version)
+to update-panic-levels
+  if not alarm-sounded? [ stop ]
+
+  ask turtles with [not is-professor? and stood-up?] [
+    ; --- RULE 1: PANIC FROM CROWD DENSITY (Tuned Down) ---
+    let local-density count other turtles in-radius 1.5
+    if local-density > 4 [
+      set panic-level panic-level + (local-density * 0.05)
+    ]
+
+    ; --- RULE 2: PANIC FROM BEING STUCK (Tuned Down) ---
+    if stuck-time > 2 [
+      set panic-level panic-level + 0.5
+    ]
+
+    ; --- RULE 3: PANIC CONTAGION (Slightly Tuned Down) ---
+    let nearby-turtles other turtles in-radius 3
+    if any? nearby-turtles [
+      let nearby-panic mean [panic-level] of nearby-turtles
+      if nearby-panic > panic-level [
+        set panic-level panic-level + ((nearby-panic - panic-level) * 0.05)
+      ]
+    ]
+
+    ; --- RULE 4: CALMING DOWN (Slightly Strengthened) ---
+    if actual-speed > (desired-speed * 0.8) and local-density < 3 [
+      set panic-level panic-level - 0.75
+    ]
+
+    ; --- FINAL STEP: ENSURE BOUNDS ---
+    set panic-level max (list 0 min (list panic-level 100))
+  ]
+end
+
+; Update colors based on panic and familiarity, with impaired override
+to update-colors
+  ask turtles with [not is-professor?] [
+    let panic-ratio panic-level / 100
+
+    ; Base color mapping (unchanged)
+    ifelse familiar? [
+      ; Familiar agents: Cyan (calm) to Purple (panicked)
+      set color (list (159 * panic-ratio) (255 * (1 - panic-ratio)) 255)
+    ] [
+      ; Unfamiliar agents: Green (calm) to Red (panicked)
+      set color (list (255 * panic-ratio) (255 * (1 - panic-ratio)) 0)
+    ]
+
+    ; Impaired override: GOLD (distinct from professor blue and the gradients)
+    if is-impaired? [
+      set color (list 255 215 0)  ; Gold
+    ]
+  ]
+
+  ; Before alarm, all are white (keeps pre-alarm view consistent)
+  if not alarm-sounded? [
+    ask turtles with [not is-professor?] [
+      set color white
+    ]
+  ]
+end
+
+; ========================================================================
+; PATHFINDING WITH COSTS (DIJKSTRA-LIKE) — FIXED TABLE KEYS (use [pxcor pycor])
+; ========================================================================
+
+to calculate-bfs-path
+  if recalc-path-timer > 0 [ stop ]
+
+  let start-patch patch-here
+  let goal-patch chosen-exit
+
+  if goal-patch = nobody [
+    set goal-patch min-one-of (exit-patches with [not blocked?]) [distance myself]
+  ]
+  if goal-patch = nobody [ stop ]
+
+  ; Check if at exit
+  if pcolor = lime and not [blocked?] of patch-here [
+    record-evacuation
+    die
+  ]
+
+  ; If on bench, try to escape then retry later
+  if [pcolor] of start-patch = 35 [
+    escape-from-seat
+    set start-patch patch-here
+    if [pcolor] of patch-here = 35 [
+      set recalc-path-timer 0.5
+      stop
+    ]
+  ]
+
+  set path-to-exit []
+  let visited table:make
+  let queue (list (list start-patch 0 [])) ; each: (patch, cost, path)
+
+  while [length queue > 0 and length path-to-exit = 0] [
+    ; pop min-cost
+    set queue sort-by [[a b] -> item 1 a < item 1 b] queue
+    let current first queue
+    set queue but-first queue
+
+    let cur-patch item 0 current
+    let cur-cost item 1 current
+    let cur-path item 2 current
+
+    ; key is the patch coordinates (valid table key)
+    let cur-key (list [pxcor] of cur-patch [pycor] of cur-patch)
+
+    if not table:has-key? visited cur-key [
+      table:put visited cur-key true
+
+      if [pcolor] of cur-patch = lime and not [blocked?] of cur-patch [
+        set path-to-exit cur-path
+        set current-path-index 0
+        set recalc-path-timer 1.5
+        stop
+      ]
+
+      ask cur-patch [
+        let neigh neighbors
+        ; Use [pxcor pycor] as key for neighbors too
+        let valid-neigh neigh with [
+          walkable? and
+          pcolor != black and
+          pcolor != 35 and
+          not table:has-key? visited (list pxcor pycor)
+        ]
+        ask valid-neigh [
+          ; step cost: diagonal = sqrt 2, orthogonal = 1
+          let step-cost (ifelse-value
+            (abs (pxcor - [pxcor] of cur-patch) + abs (pycor - [pycor] of cur-patch) = 2)
+            [ sqrt 2 ] [ 1 ])
+
+          ; congestion penalty using local density at neighbor
+          let r 1
+          let area (pi * (r * patch-size-meters) ^ 2)
+          let rho (ifelse-value (area > 0) [ count turtles in-radius r / area ] [ 0 ])
+          let cong-penalty rho
+
+          let ncost cur-cost + step-cost + cong-penalty
+          set queue lput (list self ncost (lput self cur-path)) queue
+        ]
+      ]
+    ]
+  ]
+end
+
+; ========================================================================
+; DATA COLLECTION AND STATISTICS
+; ========================================================================
+
+; Update patch-level statistics
+to update-patch-turtle-status
+  ask patches [
+    set turtle? any? turtles-here
+  ]
+end
+
+to collect-congestion-data
+  ask patches with [walkable?] [
+    let current-count count turtles-here
+    if current-count > 2 [
+      set congestion-count congestion-count + 1
+      if current-count > max-congestion-level [
+        set max-congestion-level current-count
+      ]
+    ]
+  ]
+
+  let congested-patches patches with [count turtles-here > 3]
+  if any? congested-patches [
+    set congestion-events congestion-events + 1
+    ask congested-patches [
+      if not member? self bottleneck-locations [
+        set bottleneck-locations lput self bottleneck-locations
+      ]
+    ]
+  ]
+end
+
+; Track movement statistics (modified to track stair time)
+to track-movement
+  set total-distance-traveled sum [distance-traveled] of turtles
+
+  ; Track time on stairs
+  ask turtles with [stood-up?] [
+    if patch-here != nobody [
+      ; Safe check for is-stair?
+      let patch-is-stair? false
+      ask patch-here [
+        set patch-is-stair? (is-stair? = true)
+      ]
+
+      if patch-is-stair? [
+        set time-on-stairs time-on-stairs + seconds-per-tick
+      ]
+
+      ; Update current tier
+      if [tier-level] of patch-here != nobody [
+        set current-tier [tier-level] of patch-here
+      ]
+    ]
+  ]
+end
+
+; Record individual evacuation
+to record-evacuation
+  set evacuation-time current-time - time-stood-up
+
+  if first-exit-time = 0 [
+    set first-exit-time current-time
+  ]
+  set last-exit-time current-time  ; NEW: track continuously
+
+  let current-list table:get strategy-evacuation-times evacuation-strategy
+  table:put strategy-evacuation-times evacuation-strategy (lput evacuation-time current-list)
+
+  set total-distance-traveled total-distance-traveled + distance-traveled
+  set cumulative-time-on-stairs cumulative-time-on-stairs + time-on-stairs
+end
+
+; ========================================================================
+; RESULTS AND OUTPUT
+; ========================================================================
+
+; Finalize and display results
+to finalize-statistics
+  store-simulation-results
+  display-results-table
+  display-detailed-analysis
+end
+
+; Store simulation results
+to store-simulation-results
+  table:put simulation-results "total_evacuation_time" (precision total-evacuation-time 1)
+  table:put simulation-results "first_exit_time" (precision first-exit-time 1)
+  table:put simulation-results "last_exit_time" (precision last-exit-time 1)
+  table:put simulation-results "avg_panic_level" precision avg-panic-level 2
+  table:put simulation-results "max_congestion" max-congestion-level
+  table:put simulation-results "congestion_events" congestion-events
+  table:put simulation-results "bottleneck_count" length bottleneck-locations
+  table:put simulation-results "avg_distance" precision (total-distance-traveled / (number-of-students + 1)) 2
+  table:put simulation-results "alarm_time" (precision (alarm-time * seconds-per-tick) 1)
+  table:put simulation-results "seconds_per_tick" seconds-per-tick
+  table:put simulation-results "familiarity_percentage" familiarity-percentage
+
+  foreach (table:keys strategy-evacuation-times) [ strategy ->
+    let times table:get strategy-evacuation-times strategy
+    if length times > 0 [
+      let strategy-short substring (word strategy "              ") 0 14
+      let count-str substring (word (length times) "     ") 0 5
+      let avg-str substring (word (format-time (mean times)) "          ") 0 10
+      let min-str substring (word (format-time (min times)) "          ") 0 10
+      let max-str substring (word (format-time (max times)) "          ") 0 10
+      ; Handle case with less than 2 values
+      let std-val ifelse-value (length times >= 2)
+        [precision (standard-deviation times) 1]
+        [0.0]
+      let std-str substring (word std-val "s         ") 0 9
+      output-print (word "║" strategy-short " │" count-str "│" avg-str "│" min-str "│" max-str "│" std-str "║")
+    ]
+  ]
+end
+
+; Display formatted results table
+to display-results-table
+  output-print "\n╔════════════════════════════════════════════════════════════════╗"
+  output-print   "║            FIRE EVACUATION SIMULATION RESULTS                  ║"
+  output-print   "╠════════════════════════════════════════════════════════════════╣"
+  output-print   "║ GENERAL METRICS                                                ║"
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Simulation Parameters:")
+  output-print (word "║   - Space Scale: " patch-size-meters " m/patch")
+  output-print (word "║   - Time Scale: " seconds-per-tick " s/tick")
+  output-print (word "║   - Students: " number-of-students)
+  output-print (word "║   - Layout: " lecture-hall-layout)
+  output-print (word "║   - Behavior Mode: " evacuation-behavior)
+  output-print (word "║   - Familiarity: " familiarity-percentage "%")
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Timing Results:")
+  output-print (word "║   - Fire Alarm Time: " (format-time (alarm-time * seconds-per-tick)))
+  output-print (word "║   - First Exit: " (format-time first-exit-time))
+  output-print (word "║   - Last Exit: " (format-time last-exit-time))
+  output-print (word "║   - Total Evacuation Time: " (format-time total-evacuation-time))
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Congestion Analysis:")
+  output-print (word "║   - Max Congestion Level: " max-congestion-level " persons/patch")
+  output-print (word "║   - Congestion Events: " congestion-events)
+  output-print (word "║   - Bottleneck Locations: " length bottleneck-locations)
+  output-print (word "║   - Average Final Panic: " (precision avg-panic-level 1) "%")
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print   "║ STRATEGY PERFORMANCE ANALYSIS                                  ║"
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print   "║ Strategy      │Count│ Avg Time │ Min Time │ Max Time           ║"
+  output-print   "╟───────────────┼─────┼──────────┼──────────┼────────────────────╢"
+
+  foreach (table:keys strategy-evacuation-times) [ strategy ->
+    let times table:get strategy-evacuation-times strategy
+    if length times > 0 [
+      let strategy-short substring (word strategy "              ") 0 14
+      let count-str substring (word (length times) "     ") 0 5
+      let avg-str substring (word (format-time (mean times)) "          ") 0 10
+      let min-str substring (word (format-time (min times)) "          ") 0 10
+      let max-str substring (word (format-time (max times)) "          ") 0 10
+      output-print (word "║" strategy-short " │" count-str "│" avg-str "│" min-str "│" max-str " ")
+    ]
+  ]
+
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+
+  ; Calculate evacuation efficiency metrics
+  let flow-rate (number-of-students + 1) / total-evacuation-time
+  let avg-speed total-distance-traveled / (number-of-students + 1) / total-evacuation-time * patch-size-meters
+
+  output-print "║ EFFICIENCY METRICS                                             ║"
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Flow Rate: " (precision flow-rate 2) " persons/second")
+  output-print (word "║ Average Speed: " (precision avg-speed 2) " m/s")
+  output-print (word "║ Average Distance: " (precision (total-distance-traveled / (number-of-students + 1) * patch-size-meters) 1) " meters")
+
+  ; Bottleneck analysis
+  if length bottleneck-locations > 0 [
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+    output-print "║ TOP BOTTLENECK LOCATIONS                                       ║"
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+    ; Use sort-by for lists
+    let sorted-bottlenecks sort-by [[a b] -> [congestion-count] of a > [congestion-count] of b] bottleneck-locations
+    let top-5 sublist sorted-bottlenecks 0 (min (list 5 length sorted-bottlenecks))
+    foreach top-5 [ bottleneck ->
+      output-print (word "║ (" ([pxcor] of bottleneck) "," ([pycor] of bottleneck)
+                   ") - " ([congestion-count] of bottleneck) " congestion events")
+    ]
+  ]
+
+  output-print "╚════════════════════════════════════════════════════════════════╝"
+end
+
+; Display detailed analysis in command center
+to display-detailed-analysis
+  output-print "\n╔════════════════════════════════════════════════════════════════╗"
+  output-print   "║                    DETAILED ANALYSIS                           ║"
+  output-print   "╠════════════════════════════════════════════════════════════════╣"
+
+  ; Movement Speed Analysis
+  output-print   "║ MOVEMENT SPEED PARAMETERS                                      ║"
+  output-print   "╟────────────────────────────────────────────────────────────────╢"
+  output-print   "║ Speed Type               │ Flat Surface │ On Stairs            ║"
+  output-print   "╟──────────────────────────┼──────────────┼──────────────────────╢"
+  output-print (word "║ Unimpeded (e.g. rational)│ " (precision (unimpeded-walking-speed * patch-size-meters / seconds-per-tick) 2) " m/s      │ "
+                     (precision (unimpeded-walking-speed * patch-size-meters / seconds-per-tick * stair-speed-modifier) 2) " m/s")
+  output-print (word "║ Average Evacuation       │ " (precision (average-evacuation-speed * patch-size-meters / seconds-per-tick) 2) " m/s        │ "
+                     (precision (average-evacuation-speed * patch-size-meters / seconds-per-tick * stair-speed-modifier) 2) " m/s")
+  output-print (word "║ Impaired Mobility        │ " (precision (impaired-walking-speed * patch-size-meters / seconds-per-tick) 2) " m/s     │ "
+                     (precision (impaired-walking-speed * patch-size-meters / seconds-per-tick * stair-speed-modifier) 2) " m/s")
+  output-print (word "║ Professor                │ " (precision 1.2 2) " m/s      │ " (precision (1.2 * stair-speed-modifier) 2) " m/s")
+  output-print (word "║ Stair Speed Modifier: " (precision (stair-speed-modifier * 100) 0) "% of normal speed")
+
+
+  ; Stair Analysis for Tiered Layouts
+  if lecture-hall-layout != "traditional" [
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+    output-print "║ STAIR/AISLE ANALYSIS                                           ║"
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+
+    ; Safe division check
+    if (number-of-students + 1) > 0 [
+      let avg-stair-time cumulative-time-on-stairs / (number-of-students + 1)
+      output-print (word "║ Average Time on Stairs: " (format-time avg-stair-time))
+
+      ; Calculate total evacuation times safely
+      let total-times 0
+      let total-count 0
+      foreach (table:keys strategy-evacuation-times) [ strategy ->
+        let times table:get strategy-evacuation-times strategy
+        if length times > 0 [
+          set total-times total-times + sum times
+          set total-count total-count + length times
+        ]
+      ]
+
+      if total-count > 0 and total-times > 0 [
+        let avg-total-evac-time total-times / total-count
+        if avg-total-evac-time > 0 [
+          output-print (word "║ Percentage Time on Stairs: " (precision (avg-stair-time / avg-total-evac-time * 100) 1) "%")
+        ]
+      ]
+    ]
+  ]
+
+  ; Exit Usage Analysis
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print "║ EXIT USAGE ANALYSIS                                            ║"
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+
+  let exit-list []
+  ask exit-patches [
+    let exit-info (list self pxcor pycor (ifelse-value (pxcor < 0) ["Left"] ["Right"]))
+    set exit-list lput exit-info exit-list
+  ]
+
+  foreach exit-list [ exit-info ->
+    let exit-patch item 0 exit-info
+    let x item 1 exit-info
+    let y item 2 exit-info
+    let side item 3 exit-info
+    output-print (word "║ Exit at (" x "," y ") - " side " side - "
+                      (ifelse-value [blocked?] of exit-patch ["BLOCKED"] ["OPEN"]))
+  ]
+
+  ; Strategy Distribution in Mixed Population
+  if evacuation-behavior = "mixed-population" [
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+    output-print "║ STRATEGY DISTRIBUTION (Mixed Population)                       ║"
+    output-print "╟────────────────────────────────────────────────────────────────╢"
+
+    foreach (table:keys strategy-evacuation-times) [ strategy ->
+      let times table:get strategy-evacuation-times strategy
+      let percentage precision (length times / (number-of-students + 1) * 100) 1
+      output-print (word "║ " strategy ": " (length times) " agents (" percentage "%)")
+    ]
+  ]
+
+  ; Individual Performance Metrics
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print "║ INDIVIDUAL PERFORMANCE METRICS                                 ║"
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+
+  foreach (table:keys strategy-evacuation-times) [ strategy ->
+    let times table:get strategy-evacuation-times strategy
+    if length times > 0 [
+      ; Calculate strategy-specific metrics
+      let strategy-turtles turtles with [evacuation-strategy = strategy and distance-traveled > 0]
+      if any? strategy-turtles [
+        let avg-dist mean [distance-traveled * patch-size-meters] of strategy-turtles
+        let avg-congestion mean [congestion-encounters] of strategy-turtles
+
+        output-print (word "║ " strategy ":")
+        output-print (word "║   - Average Distance: " (precision avg-dist 1) " meters")
+        output-print (word "║   - Average Congestion Encounters: " (precision avg-congestion 1))
+
+        if lecture-hall-layout != "traditional" [
+          let avg-stair-time mean [time-on-stairs] of strategy-turtles
+          output-print (word "║   - Average Time on Stairs: " (format-time avg-stair-time))
+        ]
+      ]
+    ]
+  ]
+
+  ; Reaction Time Analysis
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print "║ REACTION TIME ANALYSIS                                         ║"
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Alarm Activation: " (format-time (alarm-time * seconds-per-tick)))
+  output-print (word "║ Evacuation Started: " (format-time evacuation-start-time))
+  output-print (word "║ Delay to Start: " (format-time (evacuation-start-time - alarm-time * seconds-per-tick)))
+
+  ; --- CORRECTED: Calculate the actual average reaction delay from the agents, instead of showing a hardcoded value.
+  let all-agents-except-prof turtles with [not is-professor?]
+  if any? all-agents-except-prof [
+    let avg-delay mean [individual-reaction-delay] of all-agents-except-prof
+    output-print (word "║ Average Individual Reaction Delay: " (precision avg-delay 1) " seconds")
+  ]
+
+
+  ; Final Summary
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print "║ SIMULATION SUMMARY                                             ║"
+  output-print "╟────────────────────────────────────────────────────────────────╢"
+  output-print (word "║ Total Agents Evacuated: " (number-of-students + 1))
+  output-print (word "║ Successful Evacuation Rate: 100%")
+  output-print (word "║ Exit Blockage Active: " (ifelse-value exit-blockage? ["YES"] ["NO"]))
+  output-print (word "║ Layout Type: " lecture-hall-layout)
+  output-print (word "║ Simulation Completed Successfully")
+  output-print "╚════════════════════════════════════════════════════════════════╝"
+
+  output-print "\nAll results have been displayed in the command center."
+  output-print "No files were exported."
+end
+
+; ========================================================================
+; HELPER FUNCTIONS
+; ========================================================================
+
+; Helper function to find minimum by second element
+to-report min-by-second [list-of-lists]
+  if length list-of-lists = 0 [ report [] ]
+  let min-item first list-of-lists
+  let min-val item 1 min-item
+  foreach but-first list-of-lists [ elem ->
+    if item 1 elem < min-val [
+      set min-item elem
+      set min-val item 1 elem
+    ]
+  ]
+  report min-item
+end
+
+; --- ADDED: Helper function to generate a random number from a log-normal distribution ---
+to-report random-log-normal [mu sigma]
+  report exp(random-normal mu sigma)
+end
+
+to-report evacuation-time-report
+  ; Return appropriate evacuation time based on simulation state
+  if not alarm-sounded? [
+    report 0  ; Alarm hasn't sounded yet
+  ]
+
+  if not evacuation-started? [
+    report 0  ; No one has started evacuating yet
+  ]
+
+  ifelse any? turtles [
+    ; Still evacuating - return time so far
+    report current-time - evacuation-start-time
+  ] [
+    ; Completed - return final time
+    ifelse total-evacuation-time > 0
+      [ report total-evacuation-time ]
+      [ report current-time - evacuation-start-time ]
+  ]
+end]]></code>
+  <widgets>
+    <view x="140" wrappingAllowedX="true" y="12" frameRate="30.0" minPycor="-16" height="433" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="563" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="21" minPxcor="-21"></view>
+    <button x="12" y="10" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="63">setup</button>
+    <button x="12" y="57" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="63">go</button>
+    <button x="12" actionKey="B" y="106" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="118">toggle-exit-block</button>
+    <monitor x="1046" precision="17" y="10" height="60" fontSize="11" width="128" display="Remaining">count turtles</monitor>
+    <monitor x="1044" precision="17" y="411" height="60" fontSize="11" width="130" display="Total Time">format-time current-time</monitor>
+    <monitor x="1045" precision="17" y="344" height="60" fontSize="11" width="129" display="Evacuation Start Time">format-time evacuation-start-time</monitor>
+    <monitor x="1046" precision="17" y="276" height="60" fontSize="11" width="128" display="Evacuation Time">format-time total-evacuation-time</monitor>
+    <monitor x="1047" precision="17" y="208" height="60" fontSize="11" width="127" display="Alarm Status">ifelse-value alarm-sounded? ["SOUNDED"] ["WAITING"]</monitor>
+    <monitor x="1046" precision="17" y="75" height="60" fontSize="11" width="128" display="Evacuated">number-of-students + 1 - count turtles</monitor>
+    <monitor x="1047" precision="1" y="140" height="60" fontSize="11" width="127" display="avg-panic-level">precision avg-panic-level 1</monitor>
+    <plot x="1192" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Remaining" y="10" xMin="0.0" height="164" legend="false" xMax="10.0" yMin="0.0" width="310" xAxis="Time" display="Evacuation Progress">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Remaining" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count turtles</update>
+      </pen>
+    </plot>
+    <plot x="1191" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Average Panic Level" y="186" xMin="0.0" height="177" legend="false" xMax="10.0" yMin="0.0" width="311" xAxis="Time (seconds)" display="Panic Levels Over Time">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Avg Panic" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot avg-panic-level</update>
+      </pen>
+    </plot>
+    <plot x="1191" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Congestion Level" y="376" xMin="0.0" height="158" legend="false" xMax="10.0" yMin="0.0" width="311" xAxis="Time (seconds)" display="Congestion Events">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Max Congestion" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot max-congestion-level</update>
+      </pen>
+    </plot>
+    <monitor x="904" precision="17" y="10" height="60" fontSize="11" width="129" display="Max Congestion">max-congestion-level</monitor>
+    <chooser x="898" y="351" height="60" variable="lecture-hall-layout" current="5" width="140" display="lecture-hall-layout">
+      <choice type="string" value="traditional"></choice>
+      <choice type="string" value="center-side-aisle"></choice>
+      <choice type="string" value="center-aisle-only"></choice>
+      <choice type="string" value="tiered"></choice>
+      <choice type="string" value="side-exits-hall"></choice>
+      <choice type="string" value="wide-auditorium"></choice>
+    </chooser>
+    <switch x="904" y="419" height="40" on="false" variable="exit-blockage?" width="128" display="exit-blockage?"></switch>
+    <chooser x="899" y="283" height="60" variable="evacuation-behavior" current="4" width="139" display="evacuation-behavior">
+      <choice type="string" value="calm-and-orderly"></choice>
+      <choice type="string" value="panic-rush"></choice>
+      <choice type="string" value="follow-others"></choice>
+      <choice type="string" value="nearest-exit"></choice>
+      <choice type="string" value="mixed-population"></choice>
+    </chooser>
+    <monitor x="904" precision="17" y="78" height="60" fontSize="11" width="129" display="Bottleneck Locations">length bottleneck-locations</monitor>
+    <monitor x="904" precision="17" y="213" height="60" fontSize="11" width="129">evacuation-started?</monitor>
+    <monitor x="904" precision="17" y="145" height="60" fontSize="11" width="129">congestion-events</monitor>
+    <slider x="716" step="1" y="10" max="200" width="172" display="number-of-students" height="50" min="10" direction="Horizontal" default="200.0" variable="number-of-students"></slider>
+    <slider x="712" step="0.1" y="360" max="1.9" width="180" display="exit-capacity-per-meter" height="50" min="1.3" direction="Horizontal" default="1.6" variable="exit-capacity-per-meter"></slider>
+    <slider x="716" step="1" y="127" max="50" width="172" display="alarm-time" height="50" min="5" direction="Horizontal" default="5.0" variable="alarm-time"></slider>
+    <slider x="716" step="1" y="68" max="50" width="172" display="initial-panic-level" height="50" min="0" direction="Horizontal" default="0.0" variable="initial-panic-level"></slider>
+    <slider x="716" step="1" y="243" max="10" width="172" display="percent-impaired" height="50" min="0" direction="Horizontal" default="1.0" variable="percent-impaired"></slider>
+    <slider x="716" step="1" y="302" max="3" width="172" display="exit-width" height="50" min="1" direction="Horizontal" default="2.0" variable="exit-width"></slider>
+    <slider x="716" step="1" y="185" max="100" width="172" display="familiarity-percentage" height="50" min="0" direction="Horizontal" default="50.0" variable="familiarity-percentage"></slider>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="experiment" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>not any? turtles</exitCondition>
+      <metrics>
+        <metric>format-time total-evacuation-time</metric>
+        <metric>precision avg-panic-level 1</metric>
+        <metric>max-congestion-level</metric>
+        <metric>length bottleneck-locations</metric>
+        <metric>congestion-events</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-students">
+          <value value="50"></value>
+          <value value="100"></value>
+          <value value="200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lecture-hall-layout">
+          <value value="&quot;traditional&quot;"></value>
+          <value value="&quot;center-side-aisle&quot;"></value>
+          <value value="&quot;center-aisle-only&quot;"></value>
+          <value value="&quot;tiered&quot;"></value>
+          <value value="&quot;side-exits-hall&quot;"></value>
+          <value value="&quot;wide-auditorium&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evacuation-behavior">
+          <value value="&quot;calm-and-orderly&quot;"></value>
+          <value value="&quot;panic-rush&quot;"></value>
+          <value value="&quot;follow-others&quot;"></value>
+          <value value="&quot;nearest-exit&quot;"></value>
+          <value value="&quot;mixed-population&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-panic-level">
+          <value value="0"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="alarm-time">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="familiarity-percentage">
+          <value value="0"></value>
+          <value value="50"></value>
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="percent-impaired">
+          <value value="0"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="exit-blockage?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="exit-width">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="exit-capacity-per-meter">
+          <value value="1.3"></value>
+          <value value="1.6"></value>
+          <value value="1.9"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
